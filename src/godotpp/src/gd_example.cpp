@@ -22,3 +22,16 @@ void GDExample::_process(double delta) {
 
     set_position(new_position);
 }
+
+void GDExample::_ready() {
+    Sprite2D::_ready();
+
+    socket = net_socket_create("127.0.0.1:0");
+
+    if (socket) {
+        uint8_t data[1] = {0x46};
+
+        net_socket_send(socket, "127.0.0.1:5000", data, sizeof(data));
+    }
+
+}
