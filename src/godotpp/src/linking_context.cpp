@@ -1,5 +1,7 @@
 #include "linking_context.h"
 
+#include "net_manager.h"
+
 LinkingContext::LinkingContext() {}
 
 LinkingContext::~LinkingContext() {}
@@ -42,4 +44,21 @@ Node* LinkingContext::get_node(NetID net_id)
         return network_to_local[net_id];
     }
     return nullptr;
+}
+
+void LinkingContext::despawn_network_object(NetID net_id)
+{
+    if (network_to_local.find(net_id) != network_to_local.end())
+    {
+        Node* node = network_to_local[net_id];
+        if (node)
+        {
+            node->queue_free();
+        }
+
+        local_to_network.erase(node);
+        network_to_local.erase(net_id);
+
+        UtilityFunctions::print("[CLIENT] Despawned object NetID: ", net_id);
+    }
 }

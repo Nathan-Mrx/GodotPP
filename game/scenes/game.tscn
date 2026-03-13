@@ -1,7 +1,60 @@
 [gd_scene format=3 uid="uid://dp0vhmk4t8jgu"]
 
+[ext_resource type="Script" uid="uid://c2ns216yyxohc" path="res://scenes/packet_drop_container.gd" id="1_yqjtg"]
+[ext_resource type="Script" uid="uid://kcekuby6xt7j" path="res://scenes/ping_container.gd" id="2_lnu2h"]
+
 [node name="Game" type="Node" unique_id=1441151470]
 
 [node name="Camera2D" type="Camera2D" parent="." unique_id=852441175]
 
 [node name="NetworkManager" type="NetworkManager" parent="." unique_id=827871916]
+
+[node name="Control" type="Control" parent="." unique_id=114325408]
+layout_mode = 3
+anchors_preset = 0
+offset_left = -549.0
+offset_top = -296.0
+offset_right = -182.0
+offset_bottom = -140.0
+
+[node name="ColorRect" type="ColorRect" parent="Control" unique_id=817774906]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.10980392, 0.10980392, 0.10980392, 0.6117647)
+
+[node name="HFlowContainer" type="HFlowContainer" parent="Control" unique_id=1984829141]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="PacketDropContainer" type="VFlowContainer" parent="Control/HFlowContainer" unique_id=1769788886 node_paths=PackedStringArray("network_manager")]
+layout_mode = 2
+size_flags_horizontal = 3
+script = ExtResource("1_yqjtg")
+network_manager = NodePath("../../../NetworkManager")
+
+[node name="PDropSlider" type="HSlider" parent="Control/HFlowContainer/PacketDropContainer" unique_id=1179890315]
+custom_minimum_size = Vector2(216.955, 0)
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="PDropLabel" type="Label" parent="Control/HFlowContainer/PacketDropContainer" unique_id=1492866690]
+layout_mode = 2
+text = "Packet drop: 100%"
+
+[node name="PingContainer" type="VFlowContainer" parent="Control/HFlowContainer" unique_id=575310094 node_paths=PackedStringArray("network_manager")]
+layout_mode = 2
+size_flags_horizontal = 3
+script = ExtResource("2_lnu2h")
+network_manager = NodePath("../../../NetworkManager")
+
+[node name="PingLabel" type="Label" parent="Control/HFlowContainer/PingContainer" unique_id=1791800156]
+layout_mode = 2
+text = "Ping: 32ms"

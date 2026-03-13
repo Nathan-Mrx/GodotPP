@@ -28,6 +28,8 @@ public:
     Node* spawn_network_object(NetID net_id, TypeID type_id);
 
     Node* get_node(NetID net_id);
+
+    void despawn_network_object(NetID net_id);
 };
 
 #endif //GODOTPP_LINKING_CONTEXT_H
