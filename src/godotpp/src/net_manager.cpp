@@ -1,3 +1,15 @@
+/**
+ * @file net_manager.cpp
+ * @brief Client-side NetworkManager implementation — UDP I/O, interpolation, input.
+ *
+ * Orchestrates the full client networking lifecycle:
+ *   1. `_ready()`           — bind socket, send HELLO, register entity factories.
+ *   2. `_physics_process()` — poll packets (SPAWN / UPDATE / DESPAWN / PING_RESPONSE),
+ *                             send InputPacket + PingRequestPacket.
+ *   3. `_process()`         — interpolate entity positions for smooth rendering.
+ *   4. `_exit_tree()`       — send DISCONNECT before leaving the scene tree.
+ */
+
 #include "net_manager.h"
 
 #include <random>
@@ -9,12 +21,28 @@
 
 #include "godot_cpp/classes/viewport.hpp"
 
+// ─────────────────────────────────────────────────────────
+//  Construction / Destruction
+// ─────────────────────────────────────────────────────────
+
+/** @brief Default constructor — socket starts as null. */
 godot::NetworkManager::NetworkManager() {
     socket = nullptr;
 }
 
+/** @brief Default destructor. */
 godot::NetworkManager::~NetworkManager() {}
 
+// ─────────────────────────────────────────────────────────
+//  _ready  —  Socket creation, HELLO, type registration
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @brief Opens a UDP socket, sends HELLO with a random spawn position,
+ *        and registers the player PackedScene factory.
+ *
+ * Skipped entirely when running inside the Godot editor.
+ */
 void godot::NetworkManager::_ready()
 {
     Node::_ready();
@@ -22,17 +50,21 @@ void godot::NetworkManager::_ready()
     if (Engine::get_singleton()->is_editor_hint()) {
         set_physics_process(false);
         set_process(false);
+        UtilityFunctions::print("[CLIENT][NetworkManager] Running in editor — networking disabled");
         return;
     }
 
     set_physics_process(true);
 
-    // IMPORTANT : On réactive la boucle visuelle (Uncapped FPS) pour le lerp
+    // Enable the visual loop (uncapped FPS) for smooth interpolation
     set_process(true);
 
+    UtilityFunctions::print("[CLIENT][NetworkManager] Creating UDP socket on 127.0.0.1:0 (ephemeral port)...");
     socket = net_socket_create("127.0.0.1:0");
 
     if (socket) {
+        UtilityFunctions::print("[CLIENT][NetworkManager] Socket created successfully");
+
         HelloPacket packet;
         packet.type = PacketType::HELLO;
         std::random_device rd;
@@ -42,10 +74,11 @@ void godot::NetworkManager::_ready()
         packet.x = distrib(gen);
         packet.y = distrib(gen) / 2;
 
-        UtilityFunctions::print("[CLIENT] Send hello at: ", packet.x, ", ", packet.y);
+        UtilityFunctions::print("[CLIENT][NetworkManager] Sending HELLO to server ", server_address,
+                                " — requested spawn position (", packet.x, ", ", packet.y, ")");
         net_socket_send(socket, server_address, (uint8_t*)&packet, sizeof(HelloPacket));
     } else {
-        UtilityFunctions::print("[CLIENT] Socket could not be created");
+        UtilityFunctions::print("[CLIENT][NetworkManager] ERROR: Socket creation failed — networking is unavailable");
     }
 
     linking_context = LinkingContext();
@@ -54,21 +87,36 @@ void godot::NetworkManager::_ready()
         Ref<PackedScene> player_scene = ResourceLoader::get_singleton()->load("res://player.tscn");
         return player_scene->instantiate();
     });
+
+    UtilityFunctions::print("[CLIENT][NetworkManager] Initialization complete — waiting for server response");
 }
 
+// ─────────────────────────────────────────────────────────
+//  _process  —  Client-side entity interpolation
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @brief Interpolates (or extrapolates) entity positions using the snapshot buffer.
+ *
+ * Renders the world as it was `interpolation_delay_ms` milliseconds ago.
+ * This absorbs network jitter and packet loss while keeping motion smooth.
+ *
+ * - **Interpolation**: If `render_time` falls between two snapshots, lerp.
+ * - **Extrapolation**: If the buffer is stale, hold the last known position.
+ */
 void godot::NetworkManager::_process(double delta)
 {
     if (Engine::get_singleton()->is_editor_hint()) return;
 
     uint64_t now_ms = Time::get_singleton()->get_ticks_msec();
-    // On dessine le monde tel qu'il était il y a 100ms
+    // Render the world as it was interpolation_delay_ms ago
     uint64_t render_time = now_ms - interpolation_delay_ms;
 
     for (auto& pair : interpolation_buffers) {
         NetID net_id = pair.first;
         auto& buffer = pair.second;
 
-        // S'il n'y a pas assez de données pour interpoler, on skip
+        // Need at least 2 snapshots to interpolate
         if (buffer.size() < 2) continue;
 
         Node* node = linking_context.get_node(net_id);
@@ -76,33 +124,57 @@ void godot::NetworkManager::_process(double delta)
         Node2D* node_2d = dynamic_cast<Node2D*>(node);
         if (!node_2d) continue;
 
-        // 1. Purge des vieux snapshots inutiles (On garde seulement ceux qui encadrent notre render_time)
+        // 1. Purge stale snapshots — keep only those that bracket render_time
         while (buffer.size() > 2 && buffer[1].timestamp < render_time) {
-            buffer.erase(buffer.begin()); // Note: Sur un std::vector c'est O(N), acceptable ici vu la taille (< 10)
+            buffer.erase(buffer.begin()); // O(N) but buffer is tiny (< 10)
         }
 
         TransformSnapshot& from = buffer[0];
         TransformSnapshot& to = buffer[1];
 
-        // 2. Calcul du lerp
+        // 2. Lerp between the two enclosing snapshots
         if (render_time >= from.timestamp && render_time <= to.timestamp) {
             float t = (float)(render_time - from.timestamp) / (float)(to.timestamp - from.timestamp);
             node_2d->set_position(from.position.lerp(to.position, t));
         }
         else if (render_time > to.timestamp) {
-            // Extrapolation : Le réseau lag et on manque de snapshots futurs. On bloque sur la dernière position connue.
-            // TODO: Ajouter de la Dead-Reckoning (prédiction de trajectoire avec la vélocité) au lieu de bloquer net.
+            // Extrapolation: buffer ran dry — hold last known position
+            // TODO: Add dead-reckoning (velocity-based prediction) instead of snapping
+            UtilityFunctions::print("[CLIENT][Interpolation] WARNING: Buffer stale for NetID=", net_id,
+                                    " — extrapolating (render_time=", (int64_t)render_time,
+                                    " > latest snapshot=", (int64_t)to.timestamp,
+                                    ", gap=", (int64_t)(render_time - to.timestamp), "ms)");
             node_2d->set_position(to.position);
         }
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  _physics_process  —  Packet polling, input sending, ping
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @brief Main networking tick — polls all pending packets, sends input + ping.
+ *
+ * ### Inbound packets handled:
+ * | Type           | Action                                               |
+ * |----------------|------------------------------------------------------|
+ * | SPAWN          | Instantiate node via LinkingContext, seed interp buf. |
+ * | UPDATE         | Append snapshot to the interpolation buffer.          |
+ * | DESPAWN        | Destroy node and clean up interpolation buffer.       |
+ * | PING_RESPONSE  | Compute RTT from echoed t0.                          |
+ *
+ * ### Outbound packets sent:
+ * - **InputPacket** (every tick): current + 19 historical input frames.
+ * - **PingRequestPacket** (every ~1 s): RTT measurement probe.
+ */
 void godot::NetworkManager::_physics_process(double delta)
 {
     if (Engine::get_singleton()->is_editor_hint()) return;
 
     uint64_t now_ms = Time::get_singleton()->get_ticks_msec();
 
+    // --- RECEIVE LOOP ---
     int32_t bytes_read;
     while ((bytes_read = net_socket_poll(socket, read_buffer, 1024, sender_address, 128)) > 0)
     {
@@ -113,6 +185,11 @@ void godot::NetworkManager::_physics_process(double delta)
             SpawnPacket* packet = reinterpret_cast<SpawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(SpawnPacket))
             {
+                UtilityFunctions::print("[CLIENT][Recv] SPAWN — NetID=", packet->netID,
+                                        " TypeID=", packet->typeID,
+                                        " pos=(", packet->x, ", ", packet->y, ")",
+                                        " [", bytes_read, " bytes]");
+
                 Node* spawned_node = linking_context.spawn_network_object(packet->netID, packet->typeID);
                 if (spawned_node)
                 {
@@ -120,13 +197,20 @@ void godot::NetworkManager::_physics_process(double delta)
                     Node2D* spawned_node_2d = dynamic_cast<Node2D*>(spawned_node);
                     if (spawned_node_2d != nullptr) {
                         spawned_node_2d->set_position(Vector2(packet->x, packet->y));
-                        UtilityFunctions::print("[CLIENT] Spawned ID: ", packet->netID, " at: ", packet->x, ", ", packet->y);
 
-                        // Initialisation du buffer pour éviter un "jump" au premier UPDATE
+                        // Seed the interpolation buffer to avoid a jump on the first UPDATE
                         auto& buffer = interpolation_buffers[packet->netID];
                         buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
+
+                        UtilityFunctions::print("[CLIENT][Recv] SPAWN OK — node added to scene tree at (",
+                                                packet->x, ", ", packet->y, ")");
                     }
                 }
+            }
+            else
+            {
+                UtilityFunctions::print("[CLIENT][Recv] WARNING: SPAWN packet too small (",
+                                        bytes_read, " bytes, expected ", (int64_t)sizeof(SpawnPacket), ")");
             }
         }
         else if (packet_type == PacketType::UPDATE)
@@ -137,9 +221,12 @@ void godot::NetworkManager::_physics_process(double delta)
                 auto& buffer = interpolation_buffers[packet->netID];
                 buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
 
-                // Sécurité mémoire : On empêche le buffer de grossir à l'infini en cas de gel du renderer
+                // Memory safety: cap the buffer to prevent unbounded growth
                 if (buffer.size() > 20) {
                     buffer.erase(buffer.begin());
+                    UtilityFunctions::print("[CLIENT][Recv] UPDATE — NetID=", packet->netID,
+                                            " pos=(", packet->x, ", ", packet->y,
+                                            ") buffer trimmed to 20 snapshots");
                 }
             }
         }
@@ -148,10 +235,12 @@ void godot::NetworkManager::_physics_process(double delta)
             DespawnPacket* packet = reinterpret_cast<DespawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(DespawnPacket))
             {
+                UtilityFunctions::print("[CLIENT][Recv] DESPAWN — NetID=", packet->netID);
                 linking_context.despawn_network_object(packet->netID);
 
-                // On n'oublie pas de nettoyer la RAM
+                // Clean up interpolation data
                 interpolation_buffers.erase(packet->netID);
+                UtilityFunctions::print("[CLIENT][Recv] DESPAWN OK — interpolation buffer cleared for NetID=", packet->netID);
             }
         }
         else if (packet_type == PacketType::PING_RESPONSE)
@@ -161,11 +250,22 @@ void godot::NetworkManager::_physics_process(double delta)
             {
                 uint64_t t_receive = Time::get_singleton()->get_ticks_msec();
                 current_rtt = t_receive - packet->t0;
+
+                UtilityFunctions::print("[CLIENT][Recv] PING_RESPONSE — id=", packet->id,
+                                        " RTT=", current_rtt, "ms",
+                                        " (t0=", (int64_t)packet->t0,
+                                        " t1_server=", (int64_t)packet->t1,
+                                        " t_receive=", (int64_t)t_receive, ")");
             }
+        }
+        else
+        {
+            UtilityFunctions::print("[CLIENT][Recv] WARNING: Unknown packet type=",
+                                    (int64_t)packet_type, " (", bytes_read, " bytes) — ignoring");
         }
     }
 
-    // --- ENVOI DES INPUTS ---
+    // --- SEND INPUT ---
     Input* input = Input::get_singleton();
     if (!input) return;
 
@@ -213,12 +313,14 @@ void godot::NetworkManager::_physics_process(double delta)
 
         if (!drop_input) {
             net_socket_send(socket, server_address, (uint8_t*)&packet, sizeof(InputPacket));
+        } else {
+            UtilityFunctions::print("[CLIENT][Send] INPUT seq=", input_sequence, " DROPPED (simulated loss)");
         }
     }
 
     input_sequence++;
 
-    // --- PING SYNC ---
+    // --- PING SYNC (every ~1 second) ---
     if (now_ms - last_ping_send_time >= 1000)
     {
         PingRequestPacket ping_pkt;
@@ -231,6 +333,11 @@ void godot::NetworkManager::_physics_process(double delta)
 
             if (!drop_ping) {
                 net_socket_send(socket, server_address, (uint8_t*)&ping_pkt, sizeof(PingRequestPacket));
+                UtilityFunctions::print("[CLIENT][Send] PING_REQUEST — id=", ping_pkt.id,
+                                        " t0=", (int64_t)ping_pkt.t0,
+                                        " (last RTT=", current_rtt, "ms)");
+            } else {
+                UtilityFunctions::print("[CLIENT][Send] PING_REQUEST id=", ping_pkt.id, " DROPPED (simulated loss)");
             }
         }
 
@@ -238,6 +345,13 @@ void godot::NetworkManager::_physics_process(double delta)
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  _exit_tree  —  Graceful disconnect
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @brief Sends a DISCONNECT packet to the server before the node is removed.
+ */
 void godot::NetworkManager::_exit_tree()
 {
     if (Engine::get_singleton()->is_editor_hint()) {
@@ -248,10 +362,23 @@ void godot::NetworkManager::_exit_tree()
         DisconnectPacket packet;
         packet.type = PacketType::DISCONNECT;
         net_socket_send(socket, server_address, (uint8_t*)&packet, sizeof(DisconnectPacket));
-        UtilityFunctions::print("[CLIENT] Sent disconnect packet");
+        UtilityFunctions::print("[CLIENT][NetworkManager] Sent DISCONNECT to ", server_address, " — shutting down");
+    } else {
+        UtilityFunctions::print("[CLIENT][NetworkManager] Exiting (no active socket)");
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  Godot bindings & property accessors
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @brief Registers properties and methods with the Godot ClassDB.
+ *
+ * Exposes:
+ * - `simulated_packet_drop_chance` (float, 0–1, step 0.01)
+ * - `get_current_rtt()` for UI / debug overlay access
+ */
 void godot::NetworkManager::_bind_methods()
 {
     ClassDB::bind_method(D_METHOD("set_simulated_packet_drop_chance", "chance"), &NetworkManager::set_simulated_packet_drop_chance);
@@ -262,16 +389,20 @@ void godot::NetworkManager::_bind_methods()
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "simulated_packet_drop_chance", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_simulated_packet_drop_chance", "get_simulated_packet_drop_chance");
 }
 
+/** @brief Returns the most recently measured RTT in milliseconds. */
 uint32_t godot::NetworkManager::get_current_rtt() const
 {
     return current_rtt;
 }
 
+/** @brief Sets the probability of artificially dropping an outgoing packet. */
 void godot::NetworkManager::set_simulated_packet_drop_chance(double p_chance)
 {
     simulated_packet_drop_chance = p_chance;
+    UtilityFunctions::print("[CLIENT][NetworkManager] Simulated packet drop chance set to ", p_chance);
 }
 
+/** @brief Returns the current simulated packet drop probability. */
 double godot::NetworkManager::get_simulated_packet_drop_chance() const
 {
     return simulated_packet_drop_chance;
