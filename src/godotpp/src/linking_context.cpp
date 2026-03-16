@@ -40,14 +40,14 @@ Node* LinkingContext::spawn_network_object(NetID net_id, TypeID type_id)
     // --- Guard: already exists ---
     if (network_to_local.find(net_id) != network_to_local.end())
     {
-        UtilityFunctions::print("[CLIENT][LinkingContext] Spawn skipped — NetID=", net_id, " already mapped to an existing node");
+        UtilityFunctions::print("[CLIENT][LinkingContext] Spawn skipped - NetID=", net_id, " already mapped to an existing node");
         return network_to_local[net_id];
     }
 
     // --- Guard: unknown type ---
     if (types_factories.find(type_id) == types_factories.end())
     {
-        UtilityFunctions::print("[CLIENT][LinkingContext] ERROR: No factory registered for TypeID=", type_id, " — cannot spawn NetID=", net_id);
+        UtilityFunctions::print("[CLIENT][LinkingContext] ERROR: No factory registered for TypeID=", type_id, " - cannot spawn NetID=", net_id);
         return nullptr;
     }
 
@@ -59,7 +59,7 @@ Node* LinkingContext::spawn_network_object(NetID net_id, TypeID type_id)
     local_to_network[new_node] = net_id;
 
     UtilityFunctions::print("[CLIENT][LinkingContext] Spawned new node '", new_node->get_name(),
-                            "' — NetID=", net_id, " TypeID=", type_id,
+                            "' - NetID=", net_id, " TypeID=", type_id,
                             " (total tracked: ", (int64_t)network_to_local.size(), ")");
 
     return new_node;
@@ -76,7 +76,7 @@ Node* LinkingContext::get_node(NetID net_id)
     {
         return network_to_local[net_id];
     }
-    UtilityFunctions::print("[CLIENT][LinkingContext] WARNING: get_node() — NetID=", net_id, " not found in registry");
+    UtilityFunctions::print("[CLIENT][LinkingContext] WARNING: get_node() - NetID=", net_id, " not found in registry");
     return nullptr;
 }
 
@@ -102,6 +102,6 @@ void LinkingContext::despawn_network_object(NetID net_id)
     }
     else
     {
-        UtilityFunctions::print("[CLIENT][LinkingContext] WARNING: despawn requested for unknown NetID=", net_id, " — ignoring");
+        UtilityFunctions::print("[CLIENT][LinkingContext] WARNING: despawn requested for unknown NetID=", net_id, " - ignoring");
     }
 }

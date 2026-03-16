@@ -1,6 +1,6 @@
 /**
  * @file net_manager.h
- * @brief Client-side network manager — handles UDP I/O, interpolation, and input.
+ * @brief Client-side network manager - handles UDP I/O, interpolation, and input.
  *
  * NetworkManager is the single Godot Node responsible for all client
  * networking.  It opens a UDP socket, sends a HelloPacket on `_ready()`,

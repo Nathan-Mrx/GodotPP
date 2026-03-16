@@ -1,6 +1,6 @@
 /**
  * @file main.cpp
- * @brief Authoritative UDP game server — ECS-based, decoupled Fixed Timestep.
+ * @brief Authoritative UDP game server - ECS-based, decoupled Fixed Timestep.
  *
  * Runs a headless dedicated server that:
  * 1. Polls UDP packets as fast as possible, queuing inputs.
@@ -70,7 +70,7 @@ int main() {
         std::cerr << "[SERVER] FATAL: Failed to bind UDP port 5000" << std::endl;
         return 1;
     }
-    std::cout << "[SERVER] Socket bound — listening on UDP 0.0.0.0:5000" << std::endl;
+    std::cout << "[SERVER] Socket bound - listening on UDP 0.0.0.0:5000" << std::endl;
 
     entt::registry registry;
     uint32_t next_netID = 1;
@@ -127,7 +127,7 @@ int main() {
                 }
 
                 if (is_new_client) {
-                    std::cout << "[SERVER][Recv] HELLO — New client connected: " << sender_address << std::endl;
+                    std::cout << "[SERVER][Recv] HELLO - New client connected: " << sender_address << std::endl;
 
                     entt::entity player_entity = registry.create();
                     auto& client_conn = registry.emplace<ClientConnection>(player_entity);
@@ -217,7 +217,7 @@ int main() {
                     if (std::strncmp(sender_address, conn.address, 128) == 0)
                     {
                         NetID disconnected_net_id = view.get<NetworkIDComp>(entity).net_id;
-                        std::cout << "[SERVER][Recv] DISCONNECT — NetID: " << disconnected_net_id << std::endl;
+                        std::cout << "[SERVER][Recv] DISCONNECT - NetID: " << disconnected_net_id << std::endl;
 
                         registry.destroy(entity);
 

@@ -8,7 +8,7 @@
  * compact, platform-independent memory layout with no padding.
  *
  * @note Both the server (`server/src/main.cpp`) and the client
- *       (`godotpp/`) include this header — keep it free of
+ *       (`godotpp/`) include this header - keep it free of
  *       engine-specific dependencies.
  */
 
@@ -57,7 +57,7 @@ enum InputFlags : uint8_t
 };
 
 // ─────────────────────────────────────────────────────────
-//  Packet structures (all packed — no padding)
+//  Packet structures (all packed - no padding)
 // ─────────────────────────────────────────────────────────
 
 /**

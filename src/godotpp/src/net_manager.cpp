@@ -1,13 +1,13 @@
 /**
  * @file net_manager.cpp
- * @brief Client-side NetworkManager implementation — UDP I/O, interpolation, input.
+ * @brief Client-side NetworkManager implementation - UDP I/O, interpolation, input.
  *
  * Orchestrates the full client networking lifecycle:
- *   1. `_ready()`           — bind socket, send HELLO, register entity factories.
- *   2. `_physics_process()` — poll packets (SPAWN / UPDATE / DESPAWN / PING_RESPONSE),
+ *   1. `_ready()`           - bind socket, send HELLO, register entity factories.
+ *   2. `_physics_process()` - poll packets (SPAWN / UPDATE / DESPAWN / PING_RESPONSE),
  *                             send InputPacket + PingRequestPacket.
- *   3. `_process()`         — interpolate entity positions for smooth rendering.
- *   4. `_exit_tree()`       — send DISCONNECT before leaving the scene tree.
+ *   3. `_process()`         - interpolate entity positions for smooth rendering.
+ *   4. `_exit_tree()`       - send DISCONNECT before leaving the scene tree.
  */
 
 #include "net_manager.h"
@@ -25,7 +25,7 @@
 //  Construction / Destruction
 // ─────────────────────────────────────────────────────────
 
-/** @brief Default constructor — socket starts as null. */
+/** @brief Default constructor - socket starts as null. */
 godot::NetworkManager::NetworkManager() {
     socket = nullptr;
 }
@@ -34,7 +34,7 @@ godot::NetworkManager::NetworkManager() {
 godot::NetworkManager::~NetworkManager() {}
 
 // ─────────────────────────────────────────────────────────
-//  _ready  —  Socket creation, HELLO, type registration
+//  _ready  -  Socket creation, HELLO, type registration
 // ─────────────────────────────────────────────────────────
 
 /**
@@ -50,7 +50,7 @@ void godot::NetworkManager::_ready()
     if (Engine::get_singleton()->is_editor_hint()) {
         set_physics_process(false);
         set_process(false);
-        UtilityFunctions::print("[CLIENT][NetworkManager] Running in editor — networking disabled");
+        UtilityFunctions::print("[CLIENT][NetworkManager] Running in editor - networking disabled");
         return;
     }
 
@@ -75,10 +75,10 @@ void godot::NetworkManager::_ready()
         packet.y = distrib(gen) / 2;
 
         UtilityFunctions::print("[CLIENT][NetworkManager] Sending HELLO to server ", server_address,
-                                " — requested spawn position (", packet.x, ", ", packet.y, ")");
+                                " - requested spawn position (", packet.x, ", ", packet.y, ")");
         net_socket_send(socket, server_address, (uint8_t*)&packet, sizeof(HelloPacket));
     } else {
-        UtilityFunctions::print("[CLIENT][NetworkManager] ERROR: Socket creation failed — networking is unavailable");
+        UtilityFunctions::print("[CLIENT][NetworkManager] ERROR: Socket creation failed - networking is unavailable");
     }
 
     linking_context = LinkingContext();
@@ -88,11 +88,11 @@ void godot::NetworkManager::_ready()
         return player_scene->instantiate();
     });
 
-    UtilityFunctions::print("[CLIENT][NetworkManager] Initialization complete — waiting for server response");
+    UtilityFunctions::print("[CLIENT][NetworkManager] Initialization complete - waiting for server response");
 }
 
 // ─────────────────────────────────────────────────────────
-//  _process  —  Client-side entity interpolation
+//  _process  -  Client-side entity interpolation
 // ─────────────────────────────────────────────────────────
 
 /**
@@ -142,10 +142,10 @@ void godot::NetworkManager::_process(double delta)
             node_2d->set_position(from.position.lerp(to.position, t));
         }
         else if (render_time > to.timestamp) {
-            // Extrapolation: buffer ran dry — hold last known position
+            // Extrapolation: buffer ran dry - hold last known position
             // TODO: Add dead-reckoning (velocity-based prediction) instead of snapping
             UtilityFunctions::print("[CLIENT][Interpolation] WARNING: Buffer stale for NetID=", net_id,
-                                    " — extrapolating (render_time=", (int64_t)render_time,
+                                    " - extrapolating (render_time=", (int64_t)render_time,
                                     " > latest snapshot=", (int64_t)to.timestamp,
                                     ", gap=", (int64_t)(render_time - to.timestamp), "ms)");
             node_2d->set_position(to.position);
@@ -154,11 +154,11 @@ void godot::NetworkManager::_process(double delta)
 }
 
 // ─────────────────────────────────────────────────────────
-//  _physics_process  —  Packet polling, input sending, ping
+//  _physics_process  -  Packet polling, input sending, ping
 // ─────────────────────────────────────────────────────────
 
 /**
- * @brief Main networking tick — polls all pending packets, sends input + ping.
+ * @brief Main networking tick - polls all pending packets, sends input + ping.
  *
  * ### Inbound packets handled:
  * | Type           | Action                                               |
@@ -195,7 +195,7 @@ void godot::NetworkManager::_physics_process(double delta)
                     UtilityFunctions::print("[CLIENT][NetworkManager] Local player assigned NetID=", local_player_net_id);
                 }
 
-                UtilityFunctions::print("[CLIENT][Recv] SPAWN — NetID=", packet->netID,
+                UtilityFunctions::print("[CLIENT][Recv] SPAWN - NetID=", packet->netID,
                                         " TypeID=", packet->typeID,
                                         " pos=(", packet->x, ", ", packet->y, ")");
 
@@ -249,12 +249,12 @@ void godot::NetworkManager::_physics_process(double delta)
             DespawnPacket* packet = reinterpret_cast<DespawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(DespawnPacket))
             {
-                UtilityFunctions::print("[CLIENT][Recv] DESPAWN — NetID=", packet->netID);
+                UtilityFunctions::print("[CLIENT][Recv] DESPAWN - NetID=", packet->netID);
                 linking_context.despawn_network_object(packet->netID);
 
                 // Clean up interpolation data
                 interpolation_buffers.erase(packet->netID);
-                UtilityFunctions::print("[CLIENT][Recv] DESPAWN OK — interpolation buffer cleared for NetID=", packet->netID);
+                UtilityFunctions::print("[CLIENT][Recv] DESPAWN OK - interpolation buffer cleared for NetID=", packet->netID);
             }
         }
         else if (packet_type == PacketType::PING_RESPONSE)
@@ -265,7 +265,7 @@ void godot::NetworkManager::_physics_process(double delta)
                 uint64_t t_receive = Time::get_singleton()->get_ticks_msec();
                 current_rtt = t_receive - packet->t0;
 
-                UtilityFunctions::print("[CLIENT][Recv] PING_RESPONSE — id=", packet->id,
+                UtilityFunctions::print("[CLIENT][Recv] PING_RESPONSE - id=", packet->id,
                                         " RTT=", current_rtt, "ms",
                                         " (t0=", (int64_t)packet->t0,
                                         " t1_server=", (int64_t)packet->t1,
@@ -275,7 +275,7 @@ void godot::NetworkManager::_physics_process(double delta)
         else
         {
             UtilityFunctions::print("[CLIENT][Recv] WARNING: Unknown packet type=",
-                                    (int64_t)packet_type, " (", bytes_read, " bytes) — ignoring");
+                                    (int64_t)packet_type, " (", bytes_read, " bytes) - ignoring");
         }
     }
 
@@ -347,7 +347,7 @@ void godot::NetworkManager::_physics_process(double delta)
 
             if (!drop_ping) {
                 net_socket_send(socket, server_address, (uint8_t*)&ping_pkt, sizeof(PingRequestPacket));
-                UtilityFunctions::print("[CLIENT][Send] PING_REQUEST — id=", ping_pkt.id,
+                UtilityFunctions::print("[CLIENT][Send] PING_REQUEST - id=", ping_pkt.id,
                                         " t0=", (int64_t)ping_pkt.t0,
                                         " (last RTT=", current_rtt, "ms)");
             } else {
@@ -360,7 +360,7 @@ void godot::NetworkManager::_physics_process(double delta)
 }
 
 // ─────────────────────────────────────────────────────────
-//  _exit_tree  —  Graceful disconnect
+//  _exit_tree  -  Graceful disconnect
 // ─────────────────────────────────────────────────────────
 
 /**
@@ -376,7 +376,7 @@ void godot::NetworkManager::_exit_tree()
         DisconnectPacket packet;
         packet.type = PacketType::DISCONNECT;
         net_socket_send(socket, server_address, (uint8_t*)&packet, sizeof(DisconnectPacket));
-        UtilityFunctions::print("[CLIENT][NetworkManager] Sent DISCONNECT to ", server_address, " — shutting down");
+        UtilityFunctions::print("[CLIENT][NetworkManager] Sent DISCONNECT to ", server_address, " - shutting down");
     } else {
         UtilityFunctions::print("[CLIENT][NetworkManager] Exiting (no active socket)");
     }
