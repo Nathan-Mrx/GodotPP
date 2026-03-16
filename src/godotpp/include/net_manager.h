@@ -88,6 +88,9 @@ namespace godot {
         /** @brief Most recent round-trip time measurement (ms). */
         uint32_t current_rtt = 0;
 
+        /** @brief The server-assigned NetID for the local player. 0 if unassigned. */
+        NetID local_player_net_id = 0;
+
         /**
          * @brief Probability [0, 1] of artificially dropping an outgoing packet.
          *

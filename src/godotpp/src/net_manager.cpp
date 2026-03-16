@@ -124,9 +124,13 @@ void godot::NetworkManager::_process(double delta)
         Node2D* node_2d = dynamic_cast<Node2D*>(node);
         if (!node_2d) continue;
 
-        // 1. Purge stale snapshots — keep only those that bracket render_time
+        // 1. Purge stale snapshots
         while (buffer.size() > 2 && buffer[1].timestamp < render_time) {
-            buffer.erase(buffer.begin()); // O(N) but buffer is tiny (< 10)
+            buffer.erase(buffer.begin());
+        }
+
+        if (net_id == local_player_net_id) {
+            continue;
         }
 
         TransformSnapshot& from = buffer[0];
@@ -185,10 +189,15 @@ void godot::NetworkManager::_physics_process(double delta)
             SpawnPacket* packet = reinterpret_cast<SpawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(SpawnPacket))
             {
+                // [NEW LOGIC] Identify the local player
+                if (local_player_net_id == 0) {
+                    local_player_net_id = packet->netID;
+                    UtilityFunctions::print("[CLIENT][NetworkManager] Local player assigned NetID=", local_player_net_id);
+                }
+
                 UtilityFunctions::print("[CLIENT][Recv] SPAWN — NetID=", packet->netID,
                                         " TypeID=", packet->typeID,
-                                        " pos=(", packet->x, ", ", packet->y, ")",
-                                        " [", bytes_read, " bytes]");
+                                        " pos=(", packet->x, ", ", packet->y, ")");
 
                 Node* spawned_node = linking_context.spawn_network_object(packet->netID, packet->typeID);
                 if (spawned_node)
@@ -198,12 +207,8 @@ void godot::NetworkManager::_physics_process(double delta)
                     if (spawned_node_2d != nullptr) {
                         spawned_node_2d->set_position(Vector2(packet->x, packet->y));
 
-                        // Seed the interpolation buffer to avoid a jump on the first UPDATE
                         auto& buffer = interpolation_buffers[packet->netID];
                         buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
-
-                        UtilityFunctions::print("[CLIENT][Recv] SPAWN OK — node added to scene tree at (",
-                                                packet->x, ", ", packet->y, ")");
                     }
                 }
             }
@@ -219,14 +224,23 @@ void godot::NetworkManager::_physics_process(double delta)
             if (bytes_read >= sizeof(UpdatePacket))
             {
                 auto& buffer = interpolation_buffers[packet->netID];
-                buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
 
-                // Memory safety: cap the buffer to prevent unbounded growth
-                if (buffer.size() > 20) {
-                    buffer.erase(buffer.begin());
-                    UtilityFunctions::print("[CLIENT][Recv] UPDATE — NetID=", packet->netID,
-                                            " pos=(", packet->x, ", ", packet->y,
-                                            ") buffer trimmed to 20 snapshots");
+                if (packet->netID == local_player_net_id) {
+                    // Local Player: Bypass interpolation buffer and apply immediately
+                    buffer.clear();
+                    buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
+
+                    Node* node = linking_context.get_node(packet->netID);
+                    if (node) {
+                        Node2D* node_2d = dynamic_cast<Node2D*>(node);
+                        if (node_2d) node_2d->set_position(Vector2(packet->x, packet->y));
+                    }
+                } else {
+                    // Remote Entities: Push to interpolation buffer
+                    buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
+                    if (buffer.size() > 20) {
+                        buffer.erase(buffer.begin());
+                    }
                 }
             }
         }
