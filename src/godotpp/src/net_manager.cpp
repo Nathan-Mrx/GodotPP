@@ -109,46 +109,52 @@ void godot::NetworkManager::_process(double delta)
     if (Engine::get_singleton()->is_editor_hint()) return;
 
     uint64_t now_ms = Time::get_singleton()->get_ticks_msec();
-    // Render the world as it was interpolation_delay_ms ago
     uint64_t render_time = now_ms - interpolation_delay_ms;
 
     for (auto& pair : interpolation_buffers) {
         NetID net_id = pair.first;
         auto& buffer = pair.second;
 
-        // Need at least 2 snapshots to interpolate
-        if (buffer.size() < 2) continue;
+        // Skip interpolation for the local player (handled via strict server updates for now)
+        if (net_id == local_player_net_id) {
+            continue;
+        }
 
         Node* node = linking_context.get_node(net_id);
         if (!node) continue;
         Node2D* node_2d = dynamic_cast<Node2D*>(node);
         if (!node_2d) continue;
 
-        // 1. Purge stale snapshots
-        while (buffer.size() > 2 && buffer[1].timestamp < render_time) {
-            buffer.erase(buffer.begin());
-        }
-
-        if (net_id == local_player_net_id) {
+        if (buffer.size() < 2) {
+            if (!buffer.empty()) {
+                node_2d->set_position(buffer.back().position);
+            }
             continue;
         }
 
-        TransformSnapshot& from = buffer[0];
-        TransformSnapshot& to = buffer[1];
+        TransformSnapshot* from = nullptr;
+        TransformSnapshot* to = nullptr;
 
-        // 2. Lerp between the two enclosing snapshots
-        if (render_time >= from.timestamp && render_time <= to.timestamp) {
-            float t = (float)(render_time - from.timestamp) / (float)(to.timestamp - from.timestamp);
-            node_2d->set_position(from.position.lerp(to.position, t));
+        // Find the two snapshots that straddle our render_time
+        for (size_t i = 0; i < buffer.size() - 1; ++i) {
+            if (buffer[i].timestamp <= render_time && buffer[i + 1].timestamp >= render_time) {
+                from = &buffer[i];
+                to = &buffer[i + 1];
+                break;
+            }
         }
-        else if (render_time > to.timestamp) {
-            // Extrapolation: buffer ran dry - hold last known position
-            // TODO: Add dead-reckoning (velocity-based prediction) instead of snapping
-            UtilityFunctions::print("[CLIENT][Interpolation] WARNING: Buffer stale for NetID=", net_id,
-                                    " - extrapolating (render_time=", (int64_t)render_time,
-                                    " > latest snapshot=", (int64_t)to.timestamp,
-                                    ", gap=", (int64_t)(render_time - to.timestamp), "ms)");
-            node_2d->set_position(to.position);
+
+        if (from && to) {
+            float t = static_cast<float>(render_time - from->timestamp) / static_cast<float>(to->timestamp - from->timestamp);
+            node_2d->set_position(from->position.lerp(to->position, t));
+        }
+        else if (render_time > buffer.back().timestamp) {
+            // Render time is ahead of our buffer (extrapolation fallback)
+            node_2d->set_position(buffer.back().position);
+        }
+        else if (render_time < buffer.front().timestamp) {
+            // Render time is behind our buffer
+            node_2d->set_position(buffer.front().position);
         }
     }
 }
@@ -189,15 +195,11 @@ void godot::NetworkManager::_physics_process(double delta)
             SpawnPacket* packet = reinterpret_cast<SpawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(SpawnPacket))
             {
-                // [NEW LOGIC] Identify the local player
+                // The first SPAWN received after connection is assumed to be the local player
                 if (local_player_net_id == 0) {
                     local_player_net_id = packet->netID;
-                    UtilityFunctions::print("[CLIENT][NetworkManager] Local player assigned NetID=", local_player_net_id);
+                    UtilityFunctions::print("[CLIENT][Network] Local player assigned NetID: ", local_player_net_id);
                 }
-
-                UtilityFunctions::print("[CLIENT][Recv] SPAWN - NetID=", packet->netID,
-                                        " TypeID=", packet->typeID,
-                                        " pos=(", packet->x, ", ", packet->y, ")");
 
                 Node* spawned_node = linking_context.spawn_network_object(packet->netID, packet->typeID);
                 if (spawned_node)
@@ -206,16 +208,12 @@ void godot::NetworkManager::_physics_process(double delta)
                     Node2D* spawned_node_2d = dynamic_cast<Node2D*>(spawned_node);
                     if (spawned_node_2d != nullptr) {
                         spawned_node_2d->set_position(Vector2(packet->x, packet->y));
+                        UtilityFunctions::print("[CLIENT][Entity] Spawned ID: ", packet->netID, " at (", packet->x, ", ", packet->y, ")");
 
                         auto& buffer = interpolation_buffers[packet->netID];
                         buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
                     }
                 }
-            }
-            else
-            {
-                UtilityFunctions::print("[CLIENT][Recv] WARNING: SPAWN packet too small (",
-                                        bytes_read, " bytes, expected ", (int64_t)sizeof(SpawnPacket), ")");
             }
         }
         else if (packet_type == PacketType::UPDATE)
@@ -223,23 +221,22 @@ void godot::NetworkManager::_physics_process(double delta)
             UpdatePacket* packet = reinterpret_cast<UpdatePacket*>(read_buffer);
             if (bytes_read >= sizeof(UpdatePacket))
             {
-                auto& buffer = interpolation_buffers[packet->netID];
-
                 if (packet->netID == local_player_net_id) {
-                    // Local Player: Bypass interpolation buffer and apply immediately
-                    buffer.clear();
-                    buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
-
+                    // Local Player: Apply server authoritative position immediately (causes stutter without prediction)
                     Node* node = linking_context.get_node(packet->netID);
                     if (node) {
                         Node2D* node_2d = dynamic_cast<Node2D*>(node);
-                        if (node_2d) node_2d->set_position(Vector2(packet->x, packet->y));
+                        if (node_2d) {
+                            node_2d->set_position(Vector2(packet->x, packet->y));
+                        }
                     }
                 } else {
-                    // Remote Entities: Push to interpolation buffer
+                    // Remote Entities: Push to interpolation buffer and maintain exactly 3 snapshots
+                    auto& buffer = interpolation_buffers[packet->netID];
                     buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
-                    if (buffer.size() > 20) {
-                        buffer.erase(buffer.begin());
+
+                    while (buffer.size() > 3) {
+                        buffer.pop_front();
                     }
                 }
             }
@@ -249,12 +246,9 @@ void godot::NetworkManager::_physics_process(double delta)
             DespawnPacket* packet = reinterpret_cast<DespawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(DespawnPacket))
             {
-                UtilityFunctions::print("[CLIENT][Recv] DESPAWN - NetID=", packet->netID);
                 linking_context.despawn_network_object(packet->netID);
-
-                // Clean up interpolation data
                 interpolation_buffers.erase(packet->netID);
-                UtilityFunctions::print("[CLIENT][Recv] DESPAWN OK - interpolation buffer cleared for NetID=", packet->netID);
+                UtilityFunctions::print("[CLIENT][Entity] Despawned ID: ", packet->netID);
             }
         }
         else if (packet_type == PacketType::PING_RESPONSE)
@@ -264,18 +258,7 @@ void godot::NetworkManager::_physics_process(double delta)
             {
                 uint64_t t_receive = Time::get_singleton()->get_ticks_msec();
                 current_rtt = t_receive - packet->t0;
-
-                UtilityFunctions::print("[CLIENT][Recv] PING_RESPONSE - id=", packet->id,
-                                        " RTT=", current_rtt, "ms",
-                                        " (t0=", (int64_t)packet->t0,
-                                        " t1_server=", (int64_t)packet->t1,
-                                        " t_receive=", (int64_t)t_receive, ")");
             }
-        }
-        else
-        {
-            UtilityFunctions::print("[CLIENT][Recv] WARNING: Unknown packet type=",
-                                    (int64_t)packet_type, " (", bytes_read, " bytes) - ignoring");
         }
     }
 

@@ -11,6 +11,7 @@
 #ifndef GODOTPP_NET_MANAGER_H
 #define GODOTPP_NET_MANAGER_H
 
+#include <deque>
 #include <linking_context.h>
 #include "snl.h"
 
@@ -88,9 +89,6 @@ namespace godot {
         /** @brief Most recent round-trip time measurement (ms). */
         uint32_t current_rtt = 0;
 
-        /** @brief The server-assigned NetID for the local player. 0 if unassigned. */
-        NetID local_player_net_id = 0;
-
         /**
          * @brief Probability [0, 1] of artificially dropping an outgoing packet.
          *
@@ -98,23 +96,14 @@ namespace godot {
          */
         double simulated_packet_drop_chance = 0.0;
 
-        /**
-         * @brief Per-entity interpolation buffer (NetID → snapshot list).
-         *
-         * Each vector is kept small (≤ 20 entries); the renderer consumes
-         * snapshots in `_process()` and the physics loop appends new ones
-         * in `_physics_process()`.
-         */
-        std::unordered_map<NetID, std::vector<TransformSnapshot>> interpolation_buffers;
+        /** @brief The NetID of the local player, assigned by the server upon first SPAWN. */
+        NetID local_player_net_id = 0;
 
-        /**
-         * @brief How far in the past (ms) the renderer draws.
-         *
-         * A value of 100 means "render the world as it was 100 ms ago",
-         * which gives enough room for one or two lost packets before
-         * the interpolation buffer runs dry.
-         */
-        uint64_t interpolation_delay_ms = 100;
+        /** @brief Buffer holding the strictly last 3 snapshots for each remote entity. */
+        std::unordered_map<NetID, std::deque<TransformSnapshot>> interpolation_buffers;
+
+        /** @brief Display delay to allow future snapshots to arrive (in milliseconds). */
+        uint64_t interpolation_delay_ms = 33;
 
     public:
         NetworkManager();
