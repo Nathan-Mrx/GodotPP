@@ -99,11 +99,18 @@ namespace godot {
         /** @brief The NetID of the local player, assigned by the server upon first SPAWN. */
         NetID local_player_net_id = 0;
 
-        /** @brief Buffer holding the strictly last 3 snapshots for each remote entity. */
-        std::unordered_map<NetID, std::deque<TransformSnapshot>> interpolation_buffers;
+        /**
+         * @brief State machine for frame-based interpolation playback.
+         * Guarantees a strict frame delay regardless of server tick rate.
+         */
+        struct InterpolationState {
+            std::deque<TransformSnapshot> snapshots;
+            double playback_t = 0.0;
+            bool buffering = true;
+        };
 
-        /** @brief Display delay to allow future snapshots to arrive (in milliseconds). */
-        uint64_t interpolation_delay_ms = 33;
+        /** @brief Registry of all active interpolators keyed by NetID. */
+        std::unordered_map<NetID, InterpolationState> interpolation_states;
 
     public:
         NetworkManager();

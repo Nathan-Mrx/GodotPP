@@ -82,7 +82,7 @@ int main() {
     using clock = std::chrono::steady_clock;
     using FloatDuration = std::chrono::duration<float>;
 
-    const float FIXED_DT = 1.0f / 30.0f; // 60 Hz (0.01666... sec)
+    const float FIXED_DT = 1.0f / 60.0f; // 60 Hz (0.01666... sec)
     float accumulator = 0.0f;
     auto previous_time = clock::now();
     uint64_t tick_count = 0;

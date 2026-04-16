@@ -108,53 +108,66 @@ void godot::NetworkManager::_process(double delta)
 {
     if (Engine::get_singleton()->is_editor_hint()) return;
 
-    uint64_t now_ms = Time::get_singleton()->get_ticks_msec();
-    uint64_t render_time = now_ms - interpolation_delay_ms;
-
-    for (auto& pair : interpolation_buffers) {
+    for (auto& pair : interpolation_states) {
         NetID net_id = pair.first;
-        auto& buffer = pair.second;
 
-        // Skip interpolation for the local player (handled via strict server updates for now)
+        // The local player must reflect the exact server state.
         if (net_id == local_player_net_id) {
             continue;
         }
+
+        auto& state = pair.second;
+        auto& buffer = state.snapshots;
 
         Node* node = linking_context.get_node(net_id);
         if (!node) continue;
         Node2D* node_2d = dynamic_cast<Node2D*>(node);
         if (!node_2d) continue;
 
-        if (buffer.size() < 2) {
-            if (!buffer.empty()) {
-                node_2d->set_position(buffer.back().position);
-            }
-            continue;
-        }
-
-        TransformSnapshot* from = nullptr;
-        TransformSnapshot* to = nullptr;
-
-        // Find the two snapshots that straddle our render_time
-        for (size_t i = 0; i < buffer.size() - 1; ++i) {
-            if (buffer[i].timestamp <= render_time && buffer[i + 1].timestamp >= render_time) {
-                from = &buffer[i];
-                to = &buffer[i + 1];
-                break;
+        // 1. Buffering Phase: Wait strictly for 4 frames to guarantee 3 frames of delay
+        if (state.buffering) {
+            if (buffer.size() >= 4) {
+                state.buffering = false;
+            } else {
+                if (!buffer.empty()) {
+                    node_2d->set_position(buffer.back().position);
+                }
+                continue;
             }
         }
 
-        if (from && to) {
-            float t = static_cast<float>(render_time - from->timestamp) / static_cast<float>(to->timestamp - from->timestamp);
-            node_2d->set_position(from->position.lerp(to->position, t));
-        }
-        else if (render_time > buffer.back().timestamp) {
-            // Render time is ahead of our buffer (extrapolation fallback)
-            node_2d->set_position(buffer.back().position);
-        }
-        else if (render_time < buffer.front().timestamp) {
-            // Render time is behind our buffer
-            node_2d->set_position(buffer.front().position);
+        // 2. Playback Phase
+        if (buffer.size() >= 2) {
+            TransformSnapshot& from = buffer[0];
+            TransformSnapshot& to = buffer[1];
+
+            double duration_sec = static_cast<double>(to.timestamp - from.timestamp) / 1000.0;
+            if (duration_sec <= 0.001) duration_sec = 0.016;
+
+            double speed_multiplier = 1.0;
+            if (buffer.size() > 4) speed_multiplier = 1.1;
+            if (buffer.size() > 6) speed_multiplier = 1.5;
+
+            state.playback_t += (delta / duration_sec) * speed_multiplier;
+
+            while (state.playback_t >= 1.0 && buffer.size() >= 2) {
+                state.playback_t -= 1.0;
+                buffer.pop_front();
+
+                if (buffer.size() < 2) {
+                    state.buffering = true;
+                    state.playback_t = 0.0;
+                    break;
+                }
+            }
+
+            if (!state.buffering && buffer.size() >= 2) {
+                float t_float = static_cast<float>(state.playback_t);
+                node_2d->set_position(buffer[0].position.lerp(buffer[1].position, t_float));
+            }
+        } else {
+            state.buffering = true;
+            state.playback_t = 0.0;
         }
     }
 }
@@ -195,7 +208,6 @@ void godot::NetworkManager::_physics_process(double delta)
             SpawnPacket* packet = reinterpret_cast<SpawnPacket*>(read_buffer);
             if (bytes_read >= sizeof(SpawnPacket))
             {
-                // The first SPAWN received after connection is assumed to be the local player
                 if (local_player_net_id == 0) {
                     local_player_net_id = packet->netID;
                     UtilityFunctions::print("[CLIENT][Network] Local player assigned NetID: ", local_player_net_id);
@@ -208,10 +220,13 @@ void godot::NetworkManager::_physics_process(double delta)
                     Node2D* spawned_node_2d = dynamic_cast<Node2D*>(spawned_node);
                     if (spawned_node_2d != nullptr) {
                         spawned_node_2d->set_position(Vector2(packet->x, packet->y));
-                        UtilityFunctions::print("[CLIENT][Entity] Spawned ID: ", packet->netID, " at (", packet->x, ", ", packet->y, ")");
+                        UtilityFunctions::print("[CLIENT][Entity] Spawned ID: ", packet->netID);
 
-                        auto& buffer = interpolation_buffers[packet->netID];
-                        buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
+                        // Only buffer remote players
+                        if (packet->netID != local_player_net_id) {
+                            auto& state = interpolation_states[packet->netID];
+                            state.snapshots.push_back({now_ms, Vector2(packet->x, packet->y)});
+                        }
                     }
                 }
             }
@@ -222,7 +237,7 @@ void godot::NetworkManager::_physics_process(double delta)
             if (bytes_read >= sizeof(UpdatePacket))
             {
                 if (packet->netID == local_player_net_id) {
-                    // Local Player: Apply server authoritative position immediately (causes stutter without prediction)
+                    // Local Player: Apply authoritative position immediately (triggers visual stuttering)
                     Node* node = linking_context.get_node(packet->netID);
                     if (node) {
                         Node2D* node_2d = dynamic_cast<Node2D*>(node);
@@ -231,12 +246,12 @@ void godot::NetworkManager::_physics_process(double delta)
                         }
                     }
                 } else {
-                    // Remote Entities: Push to interpolation buffer and maintain exactly 3 snapshots
-                    auto& buffer = interpolation_buffers[packet->netID];
-                    buffer.push_back({now_ms, Vector2(packet->x, packet->y)});
+                    // Remote Players: Feed the playback state machine
+                    auto& state = interpolation_states[packet->netID];
+                    state.snapshots.push_back({now_ms, Vector2(packet->x, packet->y)});
 
-                    while (buffer.size() > 3) {
-                        buffer.pop_front();
+                    while (state.snapshots.size() > 10) {
+                        state.snapshots.pop_front();
                     }
                 }
             }
@@ -247,7 +262,7 @@ void godot::NetworkManager::_physics_process(double delta)
             if (bytes_read >= sizeof(DespawnPacket))
             {
                 linking_context.despawn_network_object(packet->netID);
-                interpolation_buffers.erase(packet->netID);
+                interpolation_states.erase(packet->netID);
                 UtilityFunctions::print("[CLIENT][Entity] Despawned ID: ", packet->netID);
             }
         }
