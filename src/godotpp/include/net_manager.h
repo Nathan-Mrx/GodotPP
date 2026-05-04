@@ -20,7 +20,28 @@
 #include <vector>
 #include <unordered_map>
 
+#include "../../shared/include/net_protocol.h"
+#include "../../shared/include/world_packet.h"
+
 namespace godot {
+
+    /**
+     * @brief Connection state machine for the client.
+     *
+     * NOT_CONNECTED  - Sending HELLO every 100 ms; times out after 1 s.
+     * CONNECTING     - HELLO_ACK received; sending HSK every 100 ms; times out after 1 s.
+     * CONNECTED      - Fully in-game; transitions to SPURIOUS if no UPDATE for 100 ms.
+     * SPURIOUS       - No recent data; sends extra pings; back to CONNECTED on PONG,
+     *                  or DISCONNECTED after 1 s.
+     * DISCONNECTED   - Terminal state; networking stops.
+     */
+    enum class ConnectionState : uint8_t {
+        NOT_CONNECTED = 0,
+        CONNECTING    = 1,
+        CONNECTED     = 2,
+        SPURIOUS      = 3,
+        DISCONNECTED  = 4
+    };
 
     /**
      * @brief A timestamped 2D position snapshot used for client-side interpolation.
@@ -63,8 +84,11 @@ namespace godot {
         /** @brief Client-side NetID ↔ Node* registry. */
         LinkingContext linking_context;
 
-        /** @brief Scratch buffer for incoming UDP datagrams (max 1024 bytes). */
-        uint8_t read_buffer[1024];
+        /** @brief Scratch buffer for incoming UDP datagrams.
+         *  Sized to accommodate large WORLD_STATE packets:
+         *  5 B header + N * 21 B per WorldObject → 8 KB handles ~390 objects. */
+        static constexpr size_t kReadBufferSize = 8192;
+        uint8_t read_buffer[kReadBufferSize];
 
         /** @brief String buffer filled by `net_socket_poll` with the sender's address. */
         char sender_address[128];
@@ -89,6 +113,27 @@ namespace godot {
         /** @brief Most recent round-trip time measurement (ms). */
         uint32_t current_rtt = 0;
 
+        // ── Clock sync (Cristian's algorithm) ──────────────────────────────
+        static constexpr int kRttSamples = 8;
+
+        /** @brief Circular buffer of recent RTT measurements. */
+        uint32_t rtt_ring_[kRttSamples] = {};
+
+        /** @brief Write head for rtt_ring_ (mod kRttSamples gives slot index). */
+        int rtt_head_ = 0;
+
+        /** @brief Number of valid entries in rtt_ring_ (up to kRttSamples). */
+        int rtt_count_ = 0;
+
+        /** @brief Smoothed one-way delay: mean of the lowest 50% RTT samples (ms). */
+        uint32_t smoothed_rtt_ms_ = 0;
+
+        /**
+         * @brief Estimated offset of the server clock relative to the local clock (ms).
+         * Positive means the server is ahead; negative means the client is ahead.
+         */
+        int64_t clock_offset_ms_ = 0;
+
         /**
          * @brief Probability [0, 1] of artificially dropping an outgoing packet.
          *
@@ -96,8 +141,20 @@ namespace godot {
          */
         double simulated_packet_drop_chance = 0.0;
 
-        /** @brief The NetID of the local player, assigned by the server upon first SPAWN. */
+        /** @brief The NetID of the local player, assigned in the HELLO_ACK. */
         NetID local_player_net_id = 0;
+
+        // ── Desired spawn position (generated once in _ready, reused on HELLO retries) ──
+        int16_t spawn_x_ = 0;
+        int16_t spawn_y_ = 0;
+
+        // ── Connection state machine ──────────────────────────────────────────────────
+        ConnectionState connection_state_    = ConnectionState::NOT_CONNECTED;
+        uint64_t state_enter_time_ms_        = 0; ///< When we last transitioned states.
+        uint64_t last_hello_time_ms_         = 0; ///< Last HELLO send time (for 100 ms retry).
+        uint64_t last_hsk_time_ms_           = 0; ///< Last HSK send time (for 100 ms retry).
+        uint64_t last_data_received_ms_      = 0; ///< Last UPDATE/SPAWN/DESPAWN receive time.
+        uint64_t last_spurious_ping_ms_      = 0; ///< Last ping sent in SPURIOUS state.
 
         /**
          * @brief State machine for frame-based interpolation playback.
@@ -111,6 +168,46 @@ namespace godot {
 
         /** @brief Registry of all active interpolators keyed by NetID. */
         std::unordered_map<NetID, InterpolationState> interpolation_states;
+
+        // ── World geometry ─────────────────────────────────────────────────────
+        /** @brief Static collision objects received from the server (WORLD_STATE).
+         *  Kept in memory so the client prediction code can run sim::simulate_step()
+         *  against the same geometry as the server. */
+        std::vector<WorldObject> world_objects_;
+
+        /** @brief Guard against processing duplicate WORLD_STATE retransmits. */
+        bool world_state_received_ = false;
+
+        // ── Client-side prediction infrastructure ─────────────────────────────
+        /**
+         * @brief One entry in the prediction history ring-buffer.
+         *
+         * The client stores (sequence, input, predicted position) for every
+         * local physics tick. When a server UPDATE arrives with input_ack=K,
+         * the reconciliation code looks up prediction_history_[K % kPredictionHistory]
+         * to compare the local prediction against the authoritative result.
+         */
+        struct PredictionFrame {
+            uint32_t   sequence; ///< Input sequence this frame corresponds to.
+            InputState input;    ///< Input applied this frame.
+            float      x, y;    ///< Predicted position AFTER applying input + collision.
+        };
+
+        static constexpr int kPredictionHistory = 64; ///< Must be power-of-two >= max expected RTT frames.
+        PredictionFrame prediction_history_[kPredictionHistory] = {};
+
+        /** @brief Current client-predicted position of the local player.
+         *  Written every physics tick; used to set the node position locally
+         *  before the server confirmation arrives. */
+        Vector2 predicted_position_ = {};
+
+        /** @brief server_tick echoed from the last UPDATE for the local player. */
+        uint32_t last_server_tick_ = 0;
+
+        /** @brief Last client input sequence the server confirmed for the local player.
+         *  Used as the rollback point: re-simulate from this frame to current_sequence
+         *  whenever the server correction exceeds the snap threshold. */
+        uint32_t last_input_ack_ = 0;
 
     public:
         NetworkManager();
@@ -150,7 +247,22 @@ namespace godot {
         /** @brief Returns the most recently measured RTT in milliseconds. */
         uint32_t get_current_rtt() const;
 
+        /** @brief Returns the smoothed RTT (mean of lowest 50% samples) in milliseconds. */
+        uint32_t get_smoothed_rtt_ms() const;
+
+        /** @brief Returns the estimated server-client clock offset in milliseconds. */
+        int64_t get_clock_offset_ms() const;
+
+        /** @brief Returns the current connection state as an integer (see ConnectionState enum). */
+        int64_t get_connection_state() const;
+
+        /** @brief Returns true only when fully connected and receiving game data. */
+        bool is_connected() const;
+
     protected:
+        /** @brief Transitions to a new state, updates the enter-time, and emits the signal. */
+        void set_connection_state(ConnectionState new_state);
+
         /** @brief Binds properties and methods to the Godot ClassDB. */
         static void _bind_methods();
     };

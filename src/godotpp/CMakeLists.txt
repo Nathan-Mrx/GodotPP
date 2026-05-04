@@ -5,6 +5,9 @@ add_library(GodotPP SHARED
         src/net_manager.cpp
         include/net_manager.h
         ../shared/include/net_protocol.h
+        ../shared/include/stream_writer.h
+        ../shared/include/stream_reader.h
+        ../shared/include/world_packet.h
         src/linking_context.cpp
         include/linking_context.h
 )

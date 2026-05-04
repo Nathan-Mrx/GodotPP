@@ -38,7 +38,11 @@ enum class PacketType : uint8_t
     DISCONNECT    = 5,  ///< Client → Server : Graceful disconnection notification.
     DESPAWN       = 6,  ///< Server → Client : An entity was removed from the world.
     PING_REQUEST  = 7,  ///< Client → Server : RTT measurement probe.
-    PING_RESPONSE = 8   ///< Server → Client : Echo of the probe with server timestamp.
+    PING_RESPONSE = 8,  ///< Server → Client : Echo of the probe with server timestamp.
+    HELLO_ACK     = 9,  ///< Server → Client : HELLO received; client moves to CONNECTING state.
+    HSK           = 10, ///< Client → Server : Handshake step 2; client is ready for game state.
+    HSK_ACK       = 11, ///< Server → Client : Handshake complete; SPAWN storm follows.
+    WORLD_STATE   = 12  ///< Server → Client : Full static level geometry (sent once on connect).
 };
 
 /**
@@ -125,13 +129,19 @@ struct InputPacket {
  * Broadcast every server tick (~60 Hz) for every entity. The client
  * stores these in its interpolation buffer and renders smoothly
  * between two snapshots offset by `interpolation_delay_ms`.
+ *
+ * `server_tick` and `input_ack` are the keys for client-side prediction
+ * reconciliation: the client can find the prediction frame whose sequence
+ * matches `input_ack`, compare it to (x, y), and roll back if they diverge.
  */
 #pragma pack(push, 1)
 struct UpdatePacket {
-    PacketType type;  ///< Always `PacketType::UPDATE`.
-    NetID      netID; ///< Target entity.
-    int16_t    x;     ///< Authoritative X position.
-    int16_t    y;     ///< Authoritative Y position.
+    PacketType type;        ///< Always `PacketType::UPDATE`.
+    NetID      netID;       ///< Target entity.
+    int16_t    x;           ///< Authoritative X position.
+    int16_t    y;           ///< Authoritative Y position.
+    uint32_t   server_tick; ///< Server simulation tick that produced this state.
+    uint32_t   input_ack;   ///< Last client input sequence processed for this entity.
 };
 #pragma pack(pop)
 
@@ -185,6 +195,44 @@ struct PingResponsePacket {
     uint32_t   id;   ///< Copied from the request.
     uint64_t   t0;   ///< Client timestamp, echoed back unchanged.
     uint64_t   t1;   ///< Server timestamp at the moment of response (ms since epoch).
+};
+#pragma pack(pop)
+
+/**
+ * @brief Server → Client : HELLO acknowledged; provides the assigned NetID.
+ *
+ * Sent immediately on receiving a valid HELLO. The client records
+ * assigned_net_id as its local player NetID and transitions to CONNECTING.
+ */
+#pragma pack(push, 1)
+struct HelloAckPacket {
+    PacketType type;            ///< Always `PacketType::HELLO_ACK`.
+    NetID      assigned_net_id; ///< NetID reserved for this client.
+};
+#pragma pack(pop)
+
+/**
+ * @brief Client → Server : Handshake step 2.
+ *
+ * Sent every 100 ms in the CONNECTING state until HSK_ACK is received.
+ * The server transitions the entity to CONNECTED and broadcasts SPAWNs.
+ */
+#pragma pack(push, 1)
+struct HskPacket {
+    PacketType type; ///< Always `PacketType::HSK`.
+};
+#pragma pack(pop)
+
+/**
+ * @brief Server → Client : Handshake complete; a SPAWN storm follows.
+ *
+ * After sending this the server broadcasts a SpawnPacket for the new
+ * player to all peers, then sends individual SpawnPackets for every
+ * already-connected entity to the new client.
+ */
+#pragma pack(push, 1)
+struct HskAckPacket {
+    PacketType type; ///< Always `PacketType::HSK_ACK`.
 };
 #pragma pack(pop)
 

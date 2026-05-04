@@ -2,7 +2,17 @@
 
 [ext_resource type="Texture2D" uid="uid://bv4f1f6tci7p3" path="res://icon.svg" id="1_4flbx"]
 
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_4flbx"]
+size = Vector2(128, 128)
+
 [node name="Player" type="Node2D" unique_id=967049974]
 
-[node name="Sprite2D" type="Sprite2D" parent="." unique_id=1831830801]
+[node name="CharacterBody2D" type="CharacterBody2D" parent="." unique_id=1435376688]
+
+[node name="Sprite2D" type="Sprite2D" parent="CharacterBody2D" unique_id=1831830801]
 texture = ExtResource("1_4flbx")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="CharacterBody2D" unique_id=1829090241]
+shape = SubResource("RectangleShape2D_4flbx")
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=1058897043]
