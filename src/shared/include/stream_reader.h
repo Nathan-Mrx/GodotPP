@@ -9,12 +9,10 @@
 /**
  * @brief Deserializes a binary buffer produced by StreamWriter.
  *
- * Adapted from GodotPPCorrection (C++17, no glm, no C++20 features).
- *
- * Parses the 2-byte bit-count footer on construction, then exposes
- * typed read methods that advance an internal cursor.
- * Every method returns std::optional — nullopt means the buffer was
- * exhausted or corrupt.
+ * Layout expected: [data bytes][bit-packed bytes][uint16 bit-byte count].
+ * The 2-byte footer is parsed on construction to split the byte and bit
+ * regions. Read methods advance an internal cursor; nullopt signals
+ * exhaustion or corruption.
  */
 class StreamReader
 {
@@ -23,14 +21,9 @@ class StreamReader
     const uint8_t* bits_;
     size_t         bits_len_;
     uint8_t cur_bit_byte_ = 0;
-    uint8_t cur_bit_idx_  = 8; // 8 = "no byte loaded yet"
+    uint8_t cur_bit_idx_  = 8; // 8 = no byte loaded
 
 public:
-    /**
-     * @param buf  Full packet buffer (including the 2-byte footer).
-     * @param len  Total buffer length in bytes.
-     * @throws std::runtime_error if the buffer is too short or the footer is corrupt.
-     */
     StreamReader(const uint8_t* buf, size_t len)
     {
         if (len < 2)
@@ -48,13 +41,10 @@ public:
         bits_len_ = bit_count;
     }
 
-    /** @brief Reads a trivially-copyable integral or enum type. */
     template<typename T>
     [[nodiscard]] std::optional<T> read()
     {
-        if (data_len_ < sizeof(T))
-            return std::nullopt;
-
+        if (data_len_ < sizeof(T)) return std::nullopt;
         T val;
         std::memcpy(&val, data_, sizeof(T));
         data_     += sizeof(T);
@@ -62,24 +52,19 @@ public:
         return val;
     }
 
-    /** @brief Reads a 32-bit float from its raw bit representation. */
     [[nodiscard]] std::optional<float> read_float()
     {
         const auto raw = read<uint32_t>();
-        if (!raw)
-            return std::nullopt;
-
+        if (!raw) return std::nullopt;
         float val;
         std::memcpy(&val, &*raw, sizeof(float));
         return val;
     }
 
-    /** @brief Reads a bit-packed boolean. */
     [[nodiscard]] std::optional<bool> read_bool()
     {
         if (cur_bit_idx_ >= 8) {
-            if (bits_len_ == 0)
-                return std::nullopt;
+            if (bits_len_ == 0) return std::nullopt;
             cur_bit_byte_ = *bits_++;
             bits_len_--;
             cur_bit_idx_ = 0;
@@ -89,32 +74,22 @@ public:
         return val;
     }
 
-    /**
-     * @brief Reads a [uint32 count][element...] array.
-     * @tparam T       Element type stored in the returned vector.
-     * @param reader_fn  Callable(StreamReader&) -> std::optional<T> per element.
-     */
+    /// Reads a [uint32 count][element...] array using a per-element reader callable.
     template<typename T, typename ReaderFn>
     [[nodiscard]] std::optional<std::vector<T>> read_array(ReaderFn reader_fn)
     {
         const auto len = read<uint32_t>();
-        if (!len)
-            return std::nullopt;
-
+        if (!len) return std::nullopt;
         std::vector<T> vec;
         vec.reserve(*len);
         for (uint32_t i = 0; i < *len; ++i) {
             auto item = reader_fn(*this);
-            if (!item)
-                return std::nullopt;
+            if (!item) return std::nullopt;
             vec.push_back(std::move(*item));
         }
         return vec;
     }
 
-    /**
-     * @brief Reads a struct via its static T::deserialize(StreamReader&) method.
-     */
     template<typename T>
     [[nodiscard]] std::optional<T> read_struct() { return T::deserialize(*this); }
 };

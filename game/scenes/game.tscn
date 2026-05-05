@@ -164,6 +164,9 @@ tile_map_data = PackedByteArray("AADh//D/AAABAAEAAADh//H/AAACAAIAAADh//L/AAACAAI
 tile_set = SubResource("TileSet_p57ef")
 
 [node name="NetworkManager" type="NetworkManager" parent="." unique_id=827871916]
+correction_K = 65.0
+correction_W = 0.0
+simulated_misprediction = 10.0
 
 [node name="Control" type="Control" parent="." unique_id=114325408]
 layout_mode = 3

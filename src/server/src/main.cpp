@@ -1,17 +1,11 @@
 /**
  * @file main.cpp
- * @brief Authoritative UDP game server - ECS-based, two-tier loop.
+ * @brief Authoritative UDP game server — ECS-based, fixed-timestep two-tier loop.
  *
- * The main loop has two distinct tiers:
- *
- * FAST PATH (every iteration, unbounded rate):
- *   Polls all pending UDP packets and responds to latency-sensitive packets
- *   (PING, HELLO, DISCONNECT) immediately - no physics tick required.
- *   INPUT packets are queued for the physics tier.
- *
- * PHYSICS PATH (fixed 60 Hz via accumulator):
- *   Consumes queued inputs, advances simulation, then broadcasts UPDATE.
- *   The loop yields CPU only when both tiers had nothing to do.
+ * FAST PATH  (every iteration, unbounded):  PING / HELLO / DISCONNECT handled
+ *            immediately; INPUT queued for the physics tier.
+ * PHYSICS PATH (60 Hz accumulator):         dequeues inputs, calls sim::simulate_step,
+ *            broadcasts UPDATE to all CONNECTED clients.
  */
 
 #include <chrono>
@@ -31,11 +25,6 @@
 #include "../../shared/include/world_packet.h"
 #include "../../shared/include/sim.h"
 
-// ─────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────
-
-/** @brief Returns the current time as milliseconds from the steady clock. */
 static uint64_t server_now_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -44,12 +33,7 @@ static uint64_t server_now_ms() {
     );
 }
 
-// ─────────────────────────────────────────────────────────
-//  World Loader - reads level.json produced by export_level.gd
-//  RECT:   param_a = half-width,  param_b = half-height
-//  CIRCLE: param_a = radius,      param_b = 0
-// ─────────────────────────────────────────────────────────
-
+/// Parses level.json produced by export_level.gd.
 static std::vector<WorldObject> load_world_from_json(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -82,64 +66,38 @@ static std::vector<WorldObject> load_world_from_json(const std::string& path) {
     return objects;
 }
 
-// Collision resolution and physics constants are in sim.h (sim namespace).
-// Both server and client prediction use sim::simulate_step() for identical results.
-
-// ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  ECS Components
-// ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-/** @brief Stores the `"ip:port"` string identifying a connected client. */
 struct ClientConnection {
     char address[128];
 };
 
-/**
- * @brief Per-client connection state machine.
- *
- * HANDSHAKING - HELLO received, waiting for HSK. Entity is reserved but
- *               not yet visible to other clients.
- * CONNECTED   - HSK received, fully in-game. Receives UPDATE broadcasts
- *               and counts toward SPAWN storms.
- */
+/// HANDSHAKING: HELLO received, entity reserved, not yet visible to peers.
+/// CONNECTED:   HSK complete, receives UPDATE broadcasts.
 enum class ClientState : uint8_t { HANDSHAKING, CONNECTED };
 
 struct ClientStateComp {
     ClientState state          = ClientState::HANDSHAKING;
-    uint64_t    last_packet_ms = 0; ///< Steady-clock ms of the last packet from this client.
+    uint64_t    last_packet_ms = 0;
 };
 
-/** @brief Holds the unique, server-assigned network identifier for an entity. */
-struct NetworkIDComp {
-    NetID net_id;
-};
+struct NetworkIDComp { NetID  net_id;  };
+struct TypeComp      { TypeID type_id; };
 
-/** @brief Stores the entity's type for client-side factory lookup. */
-struct TypeComp {
-    TypeID type_id;
-};
-
-/** @brief Authoritative 2D position maintained by the server. */
 struct Position2D {
     int16_t x;
     int16_t y;
 };
 
-/**
- * @brief Tracks input replication state and queues pending inputs.
- *
- * Decouples network reception from the physics simulation. Inputs are
- * pushed upon receiving an InputPacket, and popped at a fixed 60Hz rate
- * by the PhysicsSystem.
- */
+/// Decouples packet reception from the physics tick. Inputs are enqueued by the
+/// fast path and dequeued once per 60 Hz step. The queue is capped at 10 to
+/// prevent a lagging client from replaying seconds of stale input.
 struct ClientInputComp {
-    uint32_t last_sequence_received;       ///< Highest sequence processed by the network layer
-    std::queue<InputState> pending_inputs; ///< Buffer of inputs waiting for physical simulation
+    uint32_t               last_sequence_received = 0;
+    std::queue<InputState> pending_inputs;
 };
-
-// ─────────────────────────────────────────────────────────
-//  Main Server Loop
-// ─────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
     std::cout << "[SERVER] ═══════════════════════════════════════════" << std::endl;
@@ -161,12 +119,10 @@ int main(int argc, char* argv[]) {
     entt::registry registry;
     uint32_t next_netID = 1;
 
-    uint8_t read_buffer[1024]; // server only receives small client packets (max ~185 B)
+    uint8_t read_buffer[1024]; // largest inbound packet (InputPacket) is ~185 B
     char sender_address[128];
 
-    // ─── WORLD_STATE reliability ───────────────────────────────────────────────
-    // UDP is unreliable. After sending WORLD_STATE we schedule up to 3 retransmits
-    // spaced 200 ms apart so packet loss doesn't leave the client with an empty world.
+    // 3 WORLD_STATE retransmits at 200 ms intervals guard against UDP loss on connect.
     struct PendingWorldResend {
         std::string          addr;
         std::vector<uint8_t> bytes;
@@ -175,7 +131,6 @@ int main(int argc, char* argv[]) {
     };
     std::vector<PendingWorldResend> pending_world_resends;
 
-    // --- Fixed Timestep Setup ---
     using clock = std::chrono::steady_clock;
     using FloatDuration = std::chrono::duration<float>;
 
@@ -192,20 +147,14 @@ int main(int argc, char* argv[]) {
         float frame_time = std::chrono::duration_cast<FloatDuration>(current_time - previous_time).count();
         previous_time = current_time;
 
-        // Spiral of Death protection: Cap frame_time if the server heavily freezes
-        if (frame_time > 0.25f) {
+        if (frame_time > 0.25f) { // spiral-of-death guard
             frame_time = 0.25f;
             std::cerr << "[SERVER][Perf] WARNING: Heavy server lag detected. Capping frame time." << std::endl;
         }
 
         accumulator += frame_time;
 
-        // ─────────────────────────────────────────────
-        //  FAST PATH - Immediate-response packets
-        //  PING / HELLO / DISCONNECT are answered here,
-        //  without waiting for a physics tick.
-        //  INPUT is queued for the physics path below.
-        // ─────────────────────────────────────────────
+        // ── FAST PATH ────────────────────────────────────────────────────────────
         bool any_packets = false;
         int32_t bytes_read;
         while ((bytes_read = net_socket_poll(socket, read_buffer, 1024, sender_address, 128)) > 0)

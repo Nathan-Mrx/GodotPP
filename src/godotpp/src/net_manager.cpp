@@ -1,17 +1,13 @@
 /**
  * @file net_manager.cpp
- * @brief Client-side NetworkManager implementation - UDP I/O, interpolation, input.
- *
- * Orchestrates the full client networking lifecycle:
- *   1. `_ready()`           - bind socket, send HELLO, register entity factories.
- *   2. `_physics_process()` - poll packets (SPAWN / UPDATE / DESPAWN / PING_RESPONSE),
- *                             send InputPacket + PingRequestPacket.
- *   3. `_process()`         - interpolate entity positions for smooth rendering.
- *   4. `_exit_tree()`       - send DISCONNECT before leaving the scene tree.
+ * @brief NetworkManager implementation — see net_manager.h for architecture overview.
  */
 
 #include "net_manager.h"
 #include "../../shared/include/world_packet.h"
+#include "../../shared/include/sim.h"
+
+#include <cmath>
 
 #include <algorithm>
 #include <random>
@@ -27,28 +23,9 @@
 #include <godot_cpp/classes/rectangle_shape2d.hpp>
 #include <godot_cpp/classes/circle_shape2d.hpp>
 
-// ─────────────────────────────────────────────────────────
-//  Construction / Destruction
-// ─────────────────────────────────────────────────────────
-
-/** @brief Default constructor - socket starts as null. */
-godot::NetworkManager::NetworkManager() {
-    socket = nullptr;
-}
-
-/** @brief Default destructor. */
+godot::NetworkManager::NetworkManager() : socket(nullptr) {}
 godot::NetworkManager::~NetworkManager() {}
 
-// ─────────────────────────────────────────────────────────
-//  _ready  -  Socket creation, HELLO, type registration
-// ─────────────────────────────────────────────────────────
-
-/**
- * @brief Opens a UDP socket, sends HELLO with a random spawn position,
- *        and registers the player PackedScene factory.
- *
- * Skipped entirely when running inside the Godot editor.
- */
 void godot::NetworkManager::set_connection_state(ConnectionState new_state)
 {
     connection_state_   = new_state;
@@ -99,19 +76,6 @@ void godot::NetworkManager::_ready()
     UtilityFunctions::print("[CLIENT][NetworkManager] Ready - starting handshake with ", server_address);
 }
 
-// ─────────────────────────────────────────────────────────
-//  _process  -  Client-side entity interpolation
-// ─────────────────────────────────────────────────────────
-
-/**
- * @brief Interpolates (or extrapolates) entity positions using the snapshot buffer.
- *
- * Renders the world as it was `interpolation_delay_ms` milliseconds ago.
- * This absorbs network jitter and packet loss while keeping motion smooth.
- *
- * - **Interpolation**: If `render_time` falls between two snapshots, lerp.
- * - **Extrapolation**: If the buffer is stale, hold the last known position.
- */
 void godot::NetworkManager::_process(double delta)
 {
     if (Engine::get_singleton()->is_editor_hint()) return;
@@ -132,7 +96,7 @@ void godot::NetworkManager::_process(double delta)
         Node2D* node_2d = dynamic_cast<Node2D*>(node);
         if (!node_2d) continue;
 
-        // 1. Buffering Phase: Wait strictly for 4 frames to guarantee 3 frames of delay
+        // Accumulate 4 snapshots before starting playback to absorb jitter.
         if (state.buffering) {
             if (buffer.size() >= 4) {
                 state.buffering = false;
@@ -144,7 +108,6 @@ void godot::NetworkManager::_process(double delta)
             }
         }
 
-        // 2. Playback Phase
         if (buffer.size() >= 2) {
             TransformSnapshot& from = buffer[0];
             TransformSnapshot& to = buffer[1];
@@ -185,25 +148,6 @@ void godot::NetworkManager::_process(double delta)
     }
 }
 
-// ─────────────────────────────────────────────────────────
-//  _physics_process  -  Packet polling, input sending, ping
-// ─────────────────────────────────────────────────────────
-
-/**
- * @brief Main networking tick - polls all pending packets, sends input + ping.
- *
- * ### Inbound packets handled:
- * | Type           | Action                                               |
- * |----------------|------------------------------------------------------|
- * | SPAWN          | Instantiate node via LinkingContext, seed interp buf. |
- * | UPDATE         | Append snapshot to the interpolation buffer.          |
- * | DESPAWN        | Destroy node and clean up interpolation buffer.       |
- * | PING_RESPONSE  | Compute RTT from echoed t0.                          |
- *
- * ### Outbound packets sent:
- * - **InputPacket** (every tick): current + 19 historical input frames.
- * - **PingRequestPacket** (every ~1 s): RTT measurement probe.
- */
 void godot::NetworkManager::_physics_process(double delta)
 {
     if (Engine::get_singleton()->is_editor_hint()) return;
@@ -211,7 +155,6 @@ void godot::NetworkManager::_physics_process(double delta)
 
     uint64_t now_ms = Time::get_singleton()->get_ticks_msec();
 
-    // ── STATE MACHINE: Outgoing actions ──────────────────────────────────────
     switch (connection_state_)
     {
         case ConnectionState::NOT_CONNECTED:
@@ -316,7 +259,10 @@ void godot::NetworkManager::_physics_process(double delta)
                         spawned_node_2d->set_position(Vector2(packet->x, packet->y));
                         UtilityFunctions::print("[CLIENT][Entity] Spawned ID: ", packet->netID);
 
-                        if (packet->netID != local_player_net_id) {
+                        if (packet->netID == local_player_net_id) {
+                            pred_x_ = static_cast<float>(packet->x);
+                            pred_y_ = static_cast<float>(packet->y);
+                        } else {
                             auto& state = interpolation_states[packet->netID];
                             state.snapshots.push_back({now_ms, Vector2(packet->x, packet->y)});
                         }
@@ -335,18 +281,51 @@ void godot::NetworkManager::_physics_process(double delta)
                 }
 
                 if (packet->netID == local_player_net_id) {
-                    // Store reconciliation anchors for client-side prediction.
-                    // When prediction is active, these replace the direct position set:
-                    //   1. Find prediction_history_[input_ack_ % kPredictionHistory]
-                    //   2. Compare its (x, y) to packet (x, y)
-                    //   3. If error > threshold: rollback and re-simulate
                     last_server_tick_ = packet->server_tick;
                     last_input_ack_   = packet->input_ack;
 
-                    Node* node = linking_context.get_node(packet->netID);
-                    if (node) {
-                        Node2D* node_2d = dynamic_cast<Node2D*>(node);
-                        if (node_2d) node_2d->set_position(Vector2(packet->x, packet->y));
+                    if (!world_state_received_) {
+                        // World not loaded yet — can't forward-simulate. Direct snap.
+                        pred_x_ = static_cast<float>(packet->x);
+                        pred_y_ = static_cast<float>(packet->y);
+                    } else {
+                        // Forward-simulate the server's confirmed position from input_ack
+                        // up to the current frame so the reconciliation target is "now".
+                        float sx = static_cast<float>(packet->x);
+                        float sy = static_cast<float>(packet->y);
+                        const uint32_t ack     = packet->input_ack;
+                        const uint32_t current = input_sequence; // next seq, so [ack+1, current-1] exist
+
+                        // Forward-simulate the server's confirmed position to the current frame.
+                        // Frames [ack+1, current-1]: actual stored inputs from history.
+                        // Frame  [current]:           one speculative step with the last known
+                        //                             input, covering the in-flight frame not yet
+                        //                             stored.  A single speculative step limits
+                        //                             the input-change artifact to ≤ 1 frame (5 px)
+                        //                             instead of rtt+4 frames of pull/push.
+                        const uint32_t forward_target = current + 1;
+                        const uint32_t gap = (forward_target > ack) ? (forward_target - ack) : 0;
+
+                        if (gap > 0 && gap <= static_cast<uint32_t>(kPredictionHistory)) {
+                            const InputState speculative = (current > 0)
+                                ? prediction_history_[(current - 1) % kPredictionHistory].input
+                                : InputState{};
+
+                            for (uint32_t seq = ack + 1; seq <= current; ++seq) {
+                                InputState inp;
+                                if (seq < current) {
+                                    const PredictionFrame& frame =
+                                        prediction_history_[seq % kPredictionHistory];
+                                    inp = (frame.sequence == seq) ? frame.input : speculative;
+                                } else {
+                                    inp = speculative; // current frame: not stored yet
+                                }
+                                sim::simulate_step(sx, sy, inp, world_objects_);
+                            }
+                        }
+
+                        server_reconcile_pos_ = Vector2(sx, sy);
+                        has_server_reconcile_ = true;
                     }
                 } else {
                     auto& state = interpolation_states[packet->netID];
@@ -430,20 +409,18 @@ void godot::NetworkManager::_physics_process(double delta)
                 int64_t estimated_server_now = (int64_t)packet->t1 + (int64_t)(smoothed_rtt_ms_ / 2);
                 clock_offset_ms_ = estimated_server_now - (int64_t)t_receive;
 
-                // Pong received while spurious: connection is alive again
-                if (connection_state_ == ConnectionState::SPURIOUS) {
+                        if (connection_state_ == ConnectionState::SPURIOUS) {
                     set_connection_state(ConnectionState::CONNECTED);
                 }
             }
         }
     }
 
-    // ── SEND INPUT (only when in-game) ───────────────────────────────────────
     if (connection_state_ != ConnectionState::CONNECTED
             && connection_state_ != ConnectionState::SPURIOUS) return;
 
-    Input* input = Input::get_singleton();
-    if (!input) return;
+    Input* input_singleton = Input::get_singleton();
+    if (!input_singleton) return;
 
     static const StringName ui_up("ui_up");
     static const StringName ui_down("ui_down");
@@ -452,12 +429,11 @@ void godot::NetworkManager::_physics_process(double delta)
     static const StringName ui_accept("ui_accept");
 
     InputState current_state = {};
-    current_state.keys = InputFlags::NONE;
-    if (input->is_action_pressed(ui_up))     current_state.keys |= InputFlags::UP;
-    if (input->is_action_pressed(ui_down))   current_state.keys |= InputFlags::DOWN;
-    if (input->is_action_pressed(ui_left))   current_state.keys |= InputFlags::LEFT;
-    if (input->is_action_pressed(ui_right))  current_state.keys |= InputFlags::RIGHT;
-    if (input->is_action_pressed(ui_accept)) current_state.keys |= InputFlags::ACTION;
+    if (input_singleton->is_action_pressed(ui_up))     current_state.keys |= InputFlags::UP;
+    if (input_singleton->is_action_pressed(ui_down))   current_state.keys |= InputFlags::DOWN;
+    if (input_singleton->is_action_pressed(ui_left))   current_state.keys |= InputFlags::LEFT;
+    if (input_singleton->is_action_pressed(ui_right))  current_state.keys |= InputFlags::RIGHT;
+    if (input_singleton->is_action_pressed(ui_accept)) current_state.keys |= InputFlags::ACTION;
 
     Viewport* viewport = get_viewport();
     if (viewport) {
@@ -465,6 +441,55 @@ void godot::NetworkManager::_physics_process(double delta)
         current_state.aim_x = mouse_pos.x;
         current_state.aim_y = mouse_pos.y;
     }
+
+    // Advance the local prediction using the authoritative simulation function.
+    // Determinism between this call and the server's tick is what makes error ≈ 0
+    // in steady state — the spring only fires on actual divergence.
+    sim::simulate_step(pred_x_, pred_y_, current_state, world_objects_);
+
+    // Debug: inject an upward drift while LEFT is held so the spring is
+    // continuously visible without real network lag.
+    if (simulated_error_px_ > 0.0f && (current_state.keys & InputFlags::LEFT)) {
+        pred_y_ -= simulated_error_px_;
+        has_server_reconcile_ = true;
+    }
+
+    if (has_server_reconcile_) {
+        const Vector2 error = server_reconcile_pos_ - Vector2(pred_x_, pred_y_);
+        const float   err   = error.length();
+
+        if (err < kCorrectNoneThreshold) {
+            has_server_reconcile_ = false;
+
+        } else if (err > kCorrectSnapThreshold) {
+            pred_x_ = server_reconcile_pos_.x;
+            pred_y_ = server_reconcile_pos_.y;
+            has_server_reconcile_ = false;
+            UtilityFunctions::print("[CLIENT][Pred] Hard snap: err=", err, " px");
+
+        } else {
+            // Spring-damper: correction = (K * error - exp(-|error| * W) * error_unit * dt) * dt
+            // The exponential term tapers the correction near the target, suppressing
+            // overshoot that a plain proportional spring would produce.
+            const float   exp_damp   = std::exp(-err * correction_W_);
+            const Vector2 correction = (error * correction_K_
+                                       - (error / err) * exp_damp * static_cast<float>(delta))
+                                       * static_cast<float>(delta);
+            pred_x_ += correction.x;
+            pred_y_ += correction.y;
+        }
+    }
+
+    Node* local_node = linking_context.get_node(local_player_net_id);
+    if (local_node) {
+        Node2D* node_2d = dynamic_cast<Node2D*>(local_node);
+        if (node_2d) node_2d->set_position(Vector2(pred_x_, pred_y_));
+    }
+    predicted_position_ = Vector2(pred_x_, pred_y_);
+
+    prediction_history_[input_sequence % kPredictionHistory] = {
+        input_sequence, current_state, pred_x_, pred_y_
+    };
 
     input_history[input_sequence % 20] = current_state;
 
@@ -554,6 +579,18 @@ void godot::NetworkManager::_bind_methods()
         PropertyInfo(Variant::INT, "new_state")));
 
     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "simulated_packet_drop_chance", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_simulated_packet_drop_chance", "get_simulated_packet_drop_chance");
+
+    ClassDB::bind_method(D_METHOD("set_correction_K", "k"), &NetworkManager::set_correction_K);
+    ClassDB::bind_method(D_METHOD("get_correction_K"),      &NetworkManager::get_correction_K);
+    ClassDB::bind_method(D_METHOD("set_correction_W", "w"), &NetworkManager::set_correction_W);
+    ClassDB::bind_method(D_METHOD("get_correction_W"),      &NetworkManager::get_correction_W);
+
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "correction_K", PROPERTY_HINT_RANGE, "0.0,2000.0,1.0"), "set_correction_K", "get_correction_K");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "correction_W", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_correction_W", "get_correction_W");
+
+    ClassDB::bind_method(D_METHOD("set_simulated_error_px", "px"), &NetworkManager::set_simulated_error_px);
+    ClassDB::bind_method(D_METHOD("get_simulated_error_px"),        &NetworkManager::get_simulated_error_px);
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "simulated_error_px", PROPERTY_HINT_RANGE, "0.0,500.0,5.0"), "set_simulated_error_px", "get_simulated_error_px");
 }
 
 /** @brief Returns the most recently measured RTT in milliseconds. */
